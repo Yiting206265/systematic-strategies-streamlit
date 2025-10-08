@@ -1,13 +1,8 @@
-import ccxt
-import pandas as pd
+import requests, pandas as pd
 
-def fetch_order_book(symbol="BTC/USDT", exchange_name="binance", depth=10):
-    """
-    Fetch live order book from an exchange (via ccxt).
-    Returns: bids and asks DataFrames with price/size
-    """
-    exchange = getattr(ccxt, exchange_name)()
-    ob = exchange.fetch_order_book(symbol, limit=depth)
-    bids = pd.DataFrame(ob['bids'], columns=['price','size'])
-    asks = pd.DataFrame(ob['asks'], columns=['price','size'])
-    return bids, asks
+def fetch_order_book_coinbase(symbol="BTC-USD", depth=10):
+    url = f"https://api.exchange.coinbase.com/products/{symbol}/book?level=2"
+    resp = requests.get(url).json()
+    bids = pd.DataFrame(resp["bids"][:depth], columns=["price","size","num_orders"])
+    asks = pd.DataFrame(resp["asks"][:depth], columns=["price","size","num_orders"])
+    return bids.astype(float), asks.astype(float)
