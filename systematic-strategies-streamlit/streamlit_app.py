@@ -38,10 +38,17 @@ tabs = st.tabs(["Strategies", "Risk Metrics", "Monte Carlo", "Order Book"])
 with tabs[0]:  # Strategies
     asset = st.sidebar.selectbox("Choose Asset", ["Equities", "Crypto"])
     if asset == "Equities":
-        ticker = st.sidebar.text_input("Equity Ticker", "AAPL")
+        ticker = st.sidebar.selectbox(
+            "Choose Equity Ticker",
+            ["AAPL", "MSFT", "TSLA", "AMZN", "SPY", "QQQ", "GOOG", "NVDA"]
+        )
         df = load_equities(ticker)
-    else:
-        symbol = st.sidebar.text_input("Crypto Symbol", "BTC/USDT")
+
+    else:  # Crypto
+        symbol = st.sidebar.selectbox(
+            "Choose Crypto Symbol",
+            ["BTC-USD", "ETH-USD", "DOGE-USD", "SOL-USD", "BNB-USD"]
+        )
         df = load_crypto(symbol)
 
     st.subheader(f"Data Preview: {asset}")
