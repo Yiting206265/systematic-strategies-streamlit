@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
-from src.orderbook import fetch_order_book
+import sys, os
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+
+from orderbook import fetch_order_book
 
 from src.data_loader import load_equities, load_crypto
 from src.backtest import mean_reversion_strategy
