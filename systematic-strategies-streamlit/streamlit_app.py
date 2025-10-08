@@ -1,11 +1,19 @@
 import streamlit as st
 import pandas as pd
-from orderbook import fetch_order_book
 from src.data_loader import load_equities, load_crypto
 from src.backtest import mean_reversion_strategy
 from src.arbitrage import risk_arbitrage_signal
 from src.risk_metrics import sharpe_ratio, sortino_ratio, max_drawdown, value_at_risk, conditional_var
 from src.bayesian_eval import monte_carlo_metrics
+import os, sys
+
+# --- FIX: ensure repo root is in sys.path ---
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.append(ROOT)
+
+# now safe to import local modules
+from orderbook import fetch_order_book
 
 st.title("Quantitative Trading Strategies Dashboard")
 
