@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+from src.orderbook import fetch_order_book
 
 from src.data_loader import load_equities, load_crypto
 from src.backtest import mean_reversion_strategy
@@ -45,3 +46,22 @@ st.subheader("Monte Carlo Stress Test")
 metrics = monte_carlo_metrics(returns, n_sim=200)
 df_mc = pd.DataFrame(metrics)
 st.line_chart(df_mc['sharpe'])
+
+
+# Tabs in Streamlit
+tabs = st.tabs(["Strategies", "Risk Metrics", "Monte Carlo", "Order Book"])
+
+with tabs[3]:  # Order Book tab
+    st.subheader("Live Order Book (Binance)")
+    symbol = st.text_input("Crypto Symbol", "BTC/USDT")
+    bids, asks = fetch_order_book(symbol)
+
+    st.write("Top Bids")
+    st.dataframe(bids)
+    st.write("Top Asks")
+    st.dataframe(asks)
+
+    st.line_chart(pd.concat([
+        bids.assign(side="bid"),
+        asks.assign(side="ask")
+    ]).pivot(index="price", columns="side", values="size"))
