@@ -4,3 +4,6 @@ numpy
 matplotlib
 yfinance
 ccxt
+scipy
+quantsbin
+altair
