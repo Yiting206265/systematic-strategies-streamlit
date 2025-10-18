@@ -97,6 +97,56 @@ def implied_vol(price_mkt, S, K, T, r, q, option_type="call"):
         return np.nan
 
 # ------------------------
+# Additional Option Models
+# ------------------------
+def binomial_crr_price(S, K, T, r, q, sigma, N=200, option_type="call"):
+    if T <= 0 or sigma <= 0 or N <= 0:
+        # Immediate expiry or invalid -> intrinsic value
+        return max(0.0, (S - K) if option_type == "call" else (K - S))
+    dt = T / N
+    u = np.exp(sigma * np.sqrt(dt))
+    d = 1.0 / u
+    disc = np.exp(-r * dt)
+    p = (np.exp((r - q) * dt) - d) / (u - d)
+    p = np.clip(p, 0.0, 1.0)
+    # Terminal payoffs
+    i = np.arange(N + 1)
+    ST = S * (u ** (N - i)) * (d ** i)
+    if option_type == "call":
+        V = np.maximum(ST - K, 0.0)
+    else:
+        V = np.maximum(K - ST, 0.0)
+    # Backward induction (European)
+    for _ in range(N):
+        V = disc * (p * V[:-1] + (1 - p) * V[1:])
+    return float(V[0])
+
+def heston_mc_price(S, K, T, r, q, kappa, theta, v0, volvol, rho, option_type="call", n_paths=5000, n_steps=252, seed=42):
+    if T <= 0:
+        return max(0.0, (S - K) if option_type == "call" else (K - S))
+    rng = np.random.default_rng(seed)
+    dt = T / n_steps
+    S_t = np.full(n_paths, S, dtype=float)
+    v_t = np.full(n_paths, max(v0, 1e-8), dtype=float)
+    drift = (r - q)
+    for _ in range(n_steps):
+        z1 = rng.standard_normal(n_paths)
+        z2 = rng.standard_normal(n_paths)
+        z2 = rho * z1 + np.sqrt(max(0.0, 1 - rho * rho)) * z2
+        # Full truncation Euler for variance
+        v_sqrt = np.sqrt(np.maximum(v_t, 0.0))
+        v_next = v_t + kappa * (theta - np.maximum(v_t, 0.0)) * dt + volvol * v_sqrt * np.sqrt(dt) * z2
+        v_next = np.maximum(v_next, 0.0)
+        S_next = S_t * np.exp((drift - 0.5 * v_t) * dt + np.sqrt(v_t * dt) * z1)
+        S_t, v_t = S_next, v_next
+    if option_type == "call":
+        payoff = np.maximum(S_t - K, 0.0)
+    else:
+        payoff = np.maximum(K - S_t, 0.0)
+    price = np.exp(-r * T) * np.mean(payoff)
+    return float(price)
+
+# ------------------------
 # Streamlit App
 # ------------------------
 st.set_page_config(page_title="Systematic Strategies", page_icon="📈", layout="wide")
@@ -111,7 +161,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["Strategies", "Risk Metrics", "Monte Carlo", "Order Book", "Learn", "Options", "Market Making"])
+tabs = st.tabs(["Strategies", "Risk Metrics", "Monte Carlo", "Order Book", "Options", "Market Making", "Learn"])
 
 with tabs[0]:  # Strategies
     asset = st.sidebar.selectbox("Choose Asset", ["Equities", "Crypto"])
@@ -204,24 +254,34 @@ with tabs[3]:  # Order Book
         ])
         st.bar_chart(combined.set_index("price")["size"])
 
-with tabs[4]:  # Learn
+with tabs[6]:  # Learn
     st.subheader("Learn")
-    st.markdown("## Strategies")
-    st.markdown("Mean reversion looks for prices that moved too far from normal and expects a snap back.")
-    st.markdown("Risk arbitrage looks for temporary price gaps in related assets and expects them to close.")
-    st.markdown("## Risk Metrics")
-    st.markdown("Sharpe shows return per unit of risk. Sortino focuses on downside risk. Max Drawdown is the worst peak-to-trough drop.")
-    st.markdown("VaR estimates a typical bad day loss. CVaR shows the average of very bad days.")
-    st.markdown("## Monte Carlo")
-    st.markdown("Simulates many possible futures to see a range of outcomes, not just one history.")
-    st.markdown("## Order Book")
-    st.markdown("Shows current buy (bids) and sell (asks) interest and the spread between them.")
-    st.markdown("## Options Basics")
-    st.markdown("Options give rights to buy (call) or sell (put) at a strike by an expiry. Vanilla means standard contracts.")
-    st.markdown("Greeks measure sensitivity: Delta (price), Gamma (delta change), Vega (volatility), Theta (time), Rho (rates).")
-    st.markdown("Implied volatility is the market’s view of future jumpiness backed out from option prices.")
+    st.markdown("### Strategies")
+    st.markdown("- Mean reversion: buy when price is below its recent mean, sell when above; expects reversion.")
+    st.markdown("- Risk arbitrage: exploit temporary price gaps in related assets expecting convergence.")
+    st.markdown("\n### Risk Metrics")
+    st.markdown("- Sharpe: excess return per unit of volatility.  - Sortino: uses downside deviation only.  - Max Drawdown: worst peak-to-trough.")
+    st.markdown("- VaR: loss threshold not exceeded with prob. (e.g., 95%).  - CVaR: average loss beyond VaR.")
+    st.markdown("\n### Order Book")
+    st.markdown("Top-of-book shows best bid/ask and spread; deeper books show depth of liquidity at each level.")
+    st.markdown("\n### Options Basics")
+    st.markdown("- Calls give the right to buy; puts the right to sell, at strike K by expiry T (European exercise here).")
+    st.markdown("- Greeks: Delta (∂Price/∂S), Gamma (∂²Price/∂S²), Vega (∂Price/∂σ), Theta (∂Price/∂t), Rho (∂Price/∂r).")
+    st.markdown("- Implied Volatility (IV): volatility that makes the model price match the observed price.")
+    st.markdown("\n### Models: High-level intuition and derivations")
+    st.markdown("- Black–Scholes–Merton (BSM): assumes geometric Brownian motion. Under risk-neutral measure, solve the diffusion PDE with terminal payoff; closed form uses N(d1), N(d2). Key step: replication removes drift.")
+    st.latex(r"\frac{dS_t}{S_t} = (r - q)\,dt + \sigma\, dW_t")
+    st.latex(r"d_1 = \frac{\ln(S/K) + (r-q + \tfrac{1}{2}\sigma^2)T}{\sigma\sqrt{T}},\quad d_2 = d_1 - \sigma\sqrt{T}")
+    st.latex(r"C = S e^{-qT} N(d_1) - K e^{-rT} N(d_2),\quad P = K e^{-rT} N(-d_2) - S e^{-qT} N(-d_1)")
+    st.markdown("- Binomial (CRR): discretize time into N steps with up/down factors; price by backward induction under risk-neutral probability.")
+    st.latex(r"u = e^{\sigma\sqrt{\Delta t}},\quad d = 1/u,\quad p = \frac{e^{(r-q)\Delta t} - d}{u - d}")
+    st.markdown("- Heston: stochastic variance with correlation to price; priced via Monte Carlo or semi-analytical integration.")
+    st.latex(r"\begin{aligned} dS_t &= (r-q) S_t\,dt + \sqrt{v_t}\, S_t\, dW_t^S, \\ dv_t &= \kappa(\theta - v_t)\,dt + \xi \sqrt{v_t}\, dW_t^v, \quad d\langle W^S, W^v \rangle_t = \rho\, dt. \end{aligned}")
+    st.markdown("\n### Black–Litterman (portfolio model, not option pricing)")
+    st.markdown("- Combines market-implied equilibrium returns with investor views into posterior expected returns; stabilizes mean-variance optimization.")
+    st.latex(r"\mu_{BL} = \big( (\tau\Sigma)^{-1} + P^\top \Omega^{-1} P \big)^{-1} \big( (\tau\Sigma)^{-1} \mu^* + P^\top \Omega^{-1} Q \big)")
 
-with tabs[5]:  # Options
+with tabs[4]:  # Options
     st.subheader("Options Analytics")
     colA, colB = st.columns(2)
     with colA:
@@ -254,25 +314,58 @@ with tabs[5]:  # Options
     with colB:
         option_type = st.selectbox("Type", ["call", "put"])
         style = st.selectbox("Style", ["european"])  
-        model = st.selectbox("Model", ["Black-Scholes-Merton"])  
+        model = st.selectbox("Model", ["Black-Scholes-Merton", "Binomial (CRR)", "Heston (Monte Carlo)"])  
+        # Model-specific parameters
+        bin_N = None
+        h_kappa = h_theta = h_v0 = h_volvol = h_rho = None
+        h_paths = h_steps = None
+        if model == "Binomial (CRR)":
+            bin_N = st.slider("Binomial Steps (N)", 50, 1000, 200, step=50)
+        elif model == "Heston (Monte Carlo)":
+            h_kappa = st.number_input("kappa (mean reversion)", value=1.5, step=0.1, format="%.2f")
+            h_theta = st.number_input("theta (long-run var)", value=0.04, step=0.01, format="%.4f")
+            h_v0 = st.number_input("v0 (start var)", value=float(max(0.04, 1e-4)), step=0.01, format="%.4f")
+            h_volvol = st.number_input("vol of vol", value=0.5, step=0.05, format="%.2f")
+            h_rho = st.slider("rho (corr)", -0.99, 0.99, -0.6, 0.01)
+            h_paths = st.slider("Monte Carlo paths", 1000, 20000, 5000, step=1000)
+            h_steps = st.slider("Time steps", 50, 365, 252, step=10)
         calc = st.button("Calculate")
     if calc:
-        price = bsm_price(S, K, T, r, q, sigma, option_type)
-        delta = bsm_delta(S, K, T, r, q, sigma, option_type)
-        gamma = bsm_gamma(S, K, T, r, q, sigma)
-        vega = bsm_vega(S, K, T, r, q, sigma)
-        theta = bsm_theta(S, K, T, r, q, sigma, option_type)
-        rho = bsm_rho(S, K, T, r, q, sigma, option_type)
+        # Compute price and greeks depending on model
+        if model == "Black-Scholes-Merton":
+            price = bsm_price(S, K, T, r, q, sigma, option_type)
+            delta = bsm_delta(S, K, T, r, q, sigma, option_type)
+            gamma = bsm_gamma(S, K, T, r, q, sigma)
+            vega = bsm_vega(S, K, T, r, q, sigma)
+            theta = bsm_theta(S, K, T, r, q, sigma, option_type)
+            rho = bsm_rho(S, K, T, r, q, sigma, option_type)
+        elif model == "Binomial (CRR)":
+            price = binomial_crr_price(S, K, T, r, q, sigma, N=bin_N, option_type=option_type)
+            # Finite diff greeks on price
+            dS = max(1e-4, 0.01 * S)
+            p_up = binomial_crr_price(S + dS, K, T, r, q, sigma, N=bin_N, option_type=option_type)
+            p_dn = binomial_crr_price(S - dS, K, T, r, q, sigma, N=bin_N, option_type=option_type)
+            delta = (p_up - p_dn) / (2 * dS)
+            gamma = (p_up - 2 * price + p_dn) / (dS ** 2)
+            vega = theta = rho = np.nan
+        else:  # Heston MC
+            price = heston_mc_price(S, K, T, r, q, h_kappa, h_theta, h_v0, h_volvol, h_rho, option_type, n_paths=h_paths, n_steps=h_steps)
+            dS = max(1e-4, 0.01 * S)
+            p_up = heston_mc_price(S + dS, K, T, r, q, h_kappa, h_theta, h_v0, h_volvol, h_rho, option_type, n_paths=h_paths, n_steps=h_steps)
+            p_dn = heston_mc_price(S - dS, K, T, r, q, h_kappa, h_theta, h_v0, h_volvol, h_rho, option_type, n_paths=h_paths, n_steps=h_steps)
+            delta = (p_up - p_dn) / (2 * dS)
+            gamma = (p_up - 2 * price + p_dn) / (dS ** 2)
+            vega = theta = rho = np.nan
         k1, k2, k3 = st.columns(3)
         with k1:
             st.metric("Price", f"{price:.4f}")
-            st.metric("Delta", f"{delta:.4f}")
+            st.metric("Delta", f"{delta:.4f}" if np.isfinite(delta) else "NA")
         with k2:
-            st.metric("Gamma", f"{gamma:.6f}")
-            st.metric("Vega", f"{vega:.4f}")
+            st.metric("Gamma", f"{gamma:.6f}" if np.isfinite(gamma) else "NA")
+            st.metric("Vega", f"{vega:.4f}" if np.isfinite(vega) else "NA")
         with k3:
-            st.metric("Theta", f"{theta:.4f}")
-            st.metric("Rho", f"{rho:.4f}")
+            st.metric("Theta", f"{theta:.4f}" if np.isfinite(theta) else "NA")
+            st.metric("Rho", f"{rho:.4f}" if np.isfinite(rho) else "NA")
         col1, col2 = st.columns(2)
         with col1:
             s_grid = np.linspace(max(0.01, S*0.5), S*1.5, 100)
@@ -300,9 +393,12 @@ with tabs[5]:  # Options
                 ).properties(height=260), use_container_width=True)
         st.markdown("### Implied Volatility")
         price_mkt = st.number_input("Observed Option Price", value=float(round(price, 4)))
-        if st.button("Solve IV"):
-            iv = implied_vol(price_mkt, S, K, T, r, q, option_type)
-            st.write({"implied_vol": iv})
+        if model == "Black-Scholes-Merton":
+            if st.button("Solve IV"):
+                iv = implied_vol(price_mkt, S, K, T, r, q, option_type)
+                st.write({"implied_vol": iv})
+        else:
+            st.info("IV solve is available for Black-Scholes-Merton only.")
 
     with st.expander("Mini-Lab: IV Smile and Term Structure"):
         csmile, cterm = st.columns(2)
@@ -338,7 +434,7 @@ with tabs[5]:  # Options
         df_comb = pd.DataFrame({"Spot": s_grid, "Payoff": payoff})
         st.line_chart(df_comb.set_index("Spot"))
 
-with tabs[6]:  # Market Making
+with tabs[5]:  # Market Making
     st.subheader("Market Making Simulation (2% Price Making + Skew)")
     colL, colR = st.columns(2)
     with colL:
