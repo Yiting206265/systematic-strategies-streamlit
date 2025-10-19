@@ -161,7 +161,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["Strategies", "Risk Metrics", "Monte Carlo", "Order Book", "Options", "Market Making", "Learn"])
+tabs = st.tabs(["Strategies", "Order Book", "Options", "Market Making", "Learn"])
 
 with tabs[0]:  # Strategies
     asset = st.sidebar.selectbox("Choose Asset", ["Equities", "Crypto"])
@@ -170,17 +170,25 @@ with tabs[0]:  # Strategies
             "Choose Equity Ticker",
             ["AAPL", "MSFT", "TSLA", "AMZN", "SPY", "QQQ", "GOOG", "NVDA"]
         )
-        df = load_equities(ticker)
+        eq_period = st.sidebar.selectbox("Equity Period", ["6mo", "1y", "2y", "5y"], index=2)
+        eq_interval = st.sidebar.selectbox("Equity Interval", ["1d", "1wk", "1mo"], index=0)
+        df = load_equities(ticker, period=eq_period, interval=eq_interval)
 
     else:  # Crypto
         symbol = st.sidebar.selectbox(
             "Choose Crypto Symbol",
             ["BTC-USD", "ETH-USD", "DOGE-USD", "SOL-USD", "BNB-USD"]
         )
-        df = load_crypto(symbol)
+        cr_period = st.sidebar.selectbox("Crypto Period", ["3mo", "6mo", "1y", "2y"], index=2)
+        cr_interval = st.sidebar.selectbox("Crypto Interval", ["1h", "4h", "1d", "1wk"], index=2)
+        df = load_crypto(symbol, period=cr_period, interval=cr_interval)
 
     st.subheader(f"Data Preview: {asset}")
-    st.dataframe(df.head())
+    if not df.empty and ("Date" in df.columns or "Datetime" in df.columns):
+        date_col = "Date" if "Date" in df.columns else "Datetime"
+        rng = f"{pd.to_datetime(df[date_col].iloc[0]).date()} → {pd.to_datetime(df[date_col].iloc[-1]).date()}"
+        st.caption(f"Range: {rng}")
+    st.dataframe(df.tail())
 
     strategy = st.sidebar.selectbox("Choose Strategy", ["Mean Reversion", "Risk Arbitrage"])
     lookback = st.sidebar.slider("Lookback", 5, 30, 10)
@@ -215,27 +223,59 @@ with tabs[0]:  # Strategies
     with c3:
         st.metric("Max Drawdown", f"{max_drawdown(eq):.2%}" if len(eq) else "NA")
 
-with tabs[1]:  # Risk Metrics
-    st.subheader("Risk Metrics")
-    returns = res['strategy_returns'].dropna()
-    st.write({
-        "Sharpe": sharpe_ratio(returns),
-        "Sortino": sortino_ratio(returns),
-        "MaxDD": max_drawdown((1+returns).cumprod()),
-        "VaR": value_at_risk(returns),
-        "CVaR": conditional_var(returns)
-    })
-
-with tabs[2]:  # Monte Carlo
-    st.subheader("Monte Carlo Stress Test")
-    metrics = monte_carlo_metrics(returns, n_sim=200)
-    df_mc = pd.DataFrame(metrics)
-    if not df_mc.empty:
-        st.line_chart(df_mc["sharpe"])
+    st.markdown("### Risk Metrics")
+    if not returns.empty:
+        st.write({
+            "Sharpe": float(sharpe_ratio(returns)),
+            "Sortino": float(sortino_ratio(returns)),
+            "MaxDD": float(max_drawdown((1+returns).cumprod())),
+            "VaR": float(value_at_risk(returns)),
+            "CVaR": float(conditional_var(returns)),
+        })
     else:
-        st.info("Not enough return data yet.")
+        st.info("Not enough return data yet for risk metrics.")
 
-with tabs[3]:  # Order Book
+    st.markdown("### Monte Carlo (Bootstrap) — Uncertainty of Metrics")
+    st.markdown("This resamples historical strategy returns with replacement to approximate uncertainty in performance metrics. It is not a full price-path simulation; it shows how estimates like Sharpe may vary due to sampling noise.")
+    if not returns.empty:
+        simN = st.slider("Number of bootstrap simulations", 200, 5000, 1000, 100)
+        with st.spinner("Running bootstrap..."):
+            mc = monte_carlo_metrics(returns.values, n_sim=simN)
+            df_mc = pd.DataFrame(mc)
+        # Chain (Sharpe per simulation)
+        st.markdown("#### Sharpe chain (one value per simulation)")
+        df_chain = df_mc.reset_index().rename(columns={"index": "sim"})
+        ch_chain = alt.Chart(df_chain).mark_line().encode(
+            x=alt.X("sim:Q", title="Simulation"),
+            y=alt.Y("sharpe:Q", title="Sharpe"),
+            tooltip=["sim","sharpe"]
+        ).properties(height=220)
+        st.altair_chart(ch_chain, use_container_width=True)
+
+        # Corner plot: scatter Sharpe vs Drawdown + histograms
+        st.markdown("#### Corner plot: Sharpe vs Drawdown distribution")
+        scatter = alt.Chart(df_mc).mark_circle(opacity=0.4).encode(
+            x=alt.X("sharpe:Q", title="Sharpe"),
+            y=alt.Y("drawdown:Q", title="Bootstrapped drawdown (sum-path)"),
+            tooltip=["sharpe","drawdown"]
+        ).properties(height=260)
+        hist_sharpe = alt.Chart(df_mc).mark_bar(opacity=0.6).encode(
+            x=alt.X("sharpe:Q", bin=alt.Bin(maxbins=40), title="Sharpe"),
+            y=alt.Y('count():Q', title='Count')
+        ).properties(height=150)
+        hist_dd = alt.Chart(df_mc).mark_bar(opacity=0.6).encode(
+            x=alt.X("drawdown:Q", bin=alt.Bin(maxbins=40), title="Drawdown"),
+            y=alt.Y('count():Q', title='Count')
+        ).properties(height=150)
+        cA, cB = st.columns(2)
+        with cA:
+            st.altair_chart(scatter, use_container_width=True)
+        with cB:
+            st.altair_chart((hist_sharpe | hist_dd), use_container_width=True)
+    else:
+        st.info("Not enough return data yet for bootstrap.")
+
+with tabs[1]:  # Order Book
     st.subheader("Live Order Book")
     symbol = st.text_input("Symbol (Coinbase style)", "BTC-USD")
     with st.spinner("Fetching order book..."):
@@ -248,13 +288,50 @@ with tabs[3]:  # Order Book
     st.write("Top Asks", asks)
 
     if not bids.empty and not asks.empty:
-        combined = pd.concat([
-            bids.assign(side="bid"),
-            asks.assign(side="ask")
-        ])
-        st.bar_chart(combined.set_index("price")["size"])
+        # Clean and sort
+        bids_df = bids.copy()
+        asks_df = asks.copy()
+        if 'num_orders' in bids_df.columns:
+            bids_df = bids_df[['price','size']]
+            asks_df = asks_df[['price','size']]
+        bids_df = bids_df.astype(float).sort_values('price', ascending=False).assign(side='bid')
+        asks_df = asks_df.astype(float).sort_values('price', ascending=True).assign(side='ask')
+        combined = pd.concat([bids_df, asks_df], ignore_index=True)
 
-with tabs[6]:  # Learn
+        # Metrics
+        best_bid = bids_df['price'].max()
+        best_ask = asks_df['price'].min()
+        mid = (best_bid + best_ask) / 2.0
+        spread = best_ask - best_bid
+        s1, s2, s3 = st.columns(3)
+        s1.metric("Best Bid", f"{best_bid:.2f}")
+        s2.metric("Best Ask", f"{best_ask:.2f}")
+        s3.metric("Spread", f"{spread:.2f}")
+
+        # Depth by level (bars)
+        st.markdown("#### Depth by Level")
+        depth_bar = alt.Chart(combined).mark_bar().encode(
+            x=alt.X('price:Q', title='Price'),
+            y=alt.Y('size:Q', title='Size'),
+            color=alt.Color('side:N', scale=alt.Scale(domain=['bid','ask'], range=['#3b82f6','#ef4444'])),
+            tooltip=['side','price','size']
+        ).properties(height=260)
+        st.altair_chart(depth_bar, use_container_width=True)
+
+        # Cumulative depth (market impact proxy)
+        st.markdown("#### Cumulative Depth (Market Impact Proxy)")
+        bids_cum = bids_df.assign(cum_size=bids_df['size'].cumsum())[['price','cum_size']].assign(side='bid')
+        asks_cum = asks_df.assign(cum_size=asks_df['size'].cumsum())[['price','cum_size']].assign(side='ask')
+        cum = pd.concat([bids_cum, asks_cum], ignore_index=True)
+        cum_chart = alt.Chart(cum).mark_line().encode(
+            x=alt.X('price:Q', title='Price'),
+            y=alt.Y('cum_size:Q', title='Cumulative Size'),
+            color=alt.Color('side:N', scale=alt.Scale(domain=['bid','ask'], range=['#3b82f6','#ef4444'])),
+            tooltip=['side','price','cum_size']
+        ).properties(height=240)
+        st.altair_chart(cum_chart, use_container_width=True)
+
+with tabs[4]:  # Learn
     st.subheader("Learn")
     st.markdown("### Strategies")
     st.markdown("- Mean reversion: buy when price is below its recent mean, sell when above; expects reversion.")
@@ -281,7 +358,7 @@ with tabs[6]:  # Learn
     st.markdown("- Combines market-implied equilibrium returns with investor views into posterior expected returns; stabilizes mean-variance optimization.")
     st.latex(r"\mu_{BL} = \big( (\tau\Sigma)^{-1} + P^\top \Omega^{-1} P \big)^{-1} \big( (\tau\Sigma)^{-1} \mu^* + P^\top \Omega^{-1} Q \big)")
 
-with tabs[4]:  # Options
+with tabs[2]:  # Options
     st.subheader("Options Analytics")
     colA, colB = st.columns(2)
     with colA:
@@ -434,7 +511,7 @@ with tabs[4]:  # Options
         df_comb = pd.DataFrame({"Spot": s_grid, "Payoff": payoff})
         st.line_chart(df_comb.set_index("Spot"))
 
-with tabs[5]:  # Market Making
+with tabs[3]:  # Market Making
     st.subheader("Market Making Simulation (2% Price Making + Skew)")
     colL, colR = st.columns(2)
     with colL:
