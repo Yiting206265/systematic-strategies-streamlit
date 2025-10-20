@@ -7,6 +7,7 @@ from math import log, sqrt, exp
 from scipy.stats import norm
 from scipy.optimize import brentq
 import altair as alt
+import os
 
 from src.data_loader import load_equities, load_crypto
 from src.backtest import mean_reversion_strategy
@@ -161,7 +162,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tabs = st.tabs(["Strategies", "Order Book", "Options", "Market Making", "Learn"])
+tabs = st.tabs(["Strategies", "Order Book", "Options", "Market Making", "Factors", "Learn"])
 
 with tabs[0]:  # Strategies
     asset = st.sidebar.selectbox("Choose Asset", ["Equities", "Crypto"])
@@ -331,7 +332,339 @@ with tabs[1]:  # Order Book
         ).properties(height=240)
         st.altair_chart(cum_chart, use_container_width=True)
 
-with tabs[4]:  # Learn
+with tabs[4]:  # Factors
+    st.subheader("Factor Management")
+    st.caption("Upload or evaluate factors (CSV) and view IC/IR and quantile portfolio performance. CSV columns required: date, ticker, factor.")
+
+    base_dir = os.path.join("data", "factors")
+    os.makedirs(base_dir, exist_ok=True)
+    registry_path = os.path.join("data", "factors_registry.csv")
+    if not os.path.exists(registry_path):
+        pd.DataFrame(columns=["name","asset_universe","freq","file_path","created_at","notes"]).to_csv(registry_path, index=False)
+
+    def load_registry():
+        try:
+            return pd.read_csv(registry_path)
+        except Exception:
+            return pd.DataFrame(columns=["name","asset_universe","freq","file_path","created_at","notes"])
+
+    def evaluate_factor(fdf: pd.DataFrame, horizon: str = "1d", quantiles: int = 5, min_tickers: int = 5):
+        fdf = fdf.copy()
+        fdf['date'] = pd.to_datetime(fdf['date']).dt.tz_localize(None)
+        tickers = sorted(fdf['ticker'].unique().tolist())
+        px = []
+        for t in tickers:
+            try:
+                p = yf.download(t, period='2y', interval='1d')[["Close"]].rename(columns={"Close": t})
+                px.append(p)
+            except Exception:
+                continue
+        if len(px) == 0:
+            return None
+        # Keep dates with at least min_tickers available to form a meaningful cross-section
+        prices = pd.concat(px, axis=1)
+        prices = prices.dropna(thresh=min_tickers)
+        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        rets = prices.pct_change()
+        if horizon == '1w':
+            rets = prices.resample('W-FRI').last().pct_change()
+        next_ret = rets.shift(-1)
+        nr = next_ret.reset_index()
+        cols_nr = list(nr.columns)
+        date_col = cols_nr[0]
+        nr_long = nr.melt(id_vars=[date_col], var_name='ticker', value_name='next_ret').rename(columns={date_col: 'date'})
+        dfm = pd.merge(fdf, nr_long, on=['date','ticker'], how='inner')
+        # Keep rows with both factor and next_ret
+        dfm = dfm.dropna(subset=['factor','next_ret'])
+        if dfm.empty:
+            return None
+        # Proceed without hard filtering dates; downstream IC/LS logic will handle small groups via fallbacks
+        def cs_ic(g):
+            gg = g[['factor','next_ret']].dropna()
+            if len(gg) < 3:
+                return np.nan
+            return gg['factor'].corr(gg['next_ret'], method='spearman')
+        ic_series = dfm.groupby('date').apply(cs_ic).dropna()
+        if ic_series.empty:
+            # Fallback: pooled Spearman across all observations
+            from scipy.stats import spearmanr
+            pooled = dfm[['factor','next_ret']].dropna()
+            ic_overall = np.nan
+            if len(pooled) >= 3:
+                ic_overall = spearmanr(pooled['factor'], pooled['next_ret']).correlation
+            # synthesize a minimal IC series for plotting
+            ic_series = pd.Series([ic_overall], index=[dfm['date'].min()]) if not np.isnan(ic_overall) else pd.Series([], dtype=float)
+        ir = ic_series.mean() / ic_series.std() if (len(ic_series) > 1 and ic_series.std() not in [0, np.nan]) else np.nan
+        def assign_q(x):
+            return pd.qcut(x, q=quantiles, labels=False, duplicates='drop')
+        dfm = dfm.sort_values(['date','factor'])
+        dfm['q'] = dfm.groupby('date')['factor'].transform(assign_q)
+        grp = dfm.groupby(['date','q'])['next_ret'].mean().reset_index()
+        piv = grp.pivot(index='date', columns='q', values='next_ret').sort_index()
+        # Use only valid quantile columns
+        valid_cols = [c for c in list(piv.columns) if pd.notna(c)]
+        valid_cols = sorted(valid_cols)
+        if len(valid_cols) >= 2:
+            low_col, high_col = valid_cols[0], valid_cols[-1]
+            ls = (piv[high_col] - piv[low_col]).fillna(0)
+            eq_curves = (1 + piv.fillna(0)).cumprod()
+        else:
+            # Fallback: build tertile LS using rank thresholds
+            def ls_tercile(g):
+                g2 = g.copy()
+                # ranks: lower rank -> bottom, higher -> top
+                g2['rk'] = g2['factor'].rank(method='first')
+                n = len(g2)
+                if n < 3:
+                    return 0.0
+                lo_thr = np.floor(n/3)
+                hi_thr = np.ceil(2*n/3)
+                low_ret = g2.nsmallest(int(max(1, lo_thr)), 'rk')['next_ret'].mean()
+                high_ret = g2.nlargest(int(max(1, n - hi_thr)), 'rk')['next_ret'].mean()
+                return (high_ret - low_ret)
+            ls_series = dfm.groupby('date').apply(ls_tercile)
+            ls = ls_series.reindex(sorted(ls_series.index)).fillna(0)
+            eq_curves = pd.DataFrame()  # not available in fallback
+        ls_curve = (1 + ls.fillna(0)).cumprod()
+        return {"ic_series": ic_series, "ir": ir, "eq_curves": eq_curves, "ls_curve": ls_curve, "sample": dfm}
+
+    # Panel-based evaluator for the default demo to avoid merge mismatches
+    def evaluate_from_panels(f_panel: pd.DataFrame, prices: pd.DataFrame, horizon: str = "1d", quantiles: int = 5):
+        # f_panel: wide factor DataFrame indexed by date, columns=tickers
+        # prices: wide close prices aligned similarly
+        prices = prices.copy()
+        f_panel = f_panel.copy()
+        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        f_panel.index = pd.to_datetime(f_panel.index).tz_localize(None)
+        # Returns panel
+        if horizon == '1w':
+            px = prices.resample('W-FRI').last()
+        else:
+            px = prices
+        rets = px.pct_change().shift(-1)
+        # Align common index/columns
+        common_cols = sorted(list(set(f_panel.columns).intersection(set(rets.columns))))
+        if len(common_cols) < 3:
+            return None
+        idx = f_panel.index.intersection(rets.index)
+        f_panel = f_panel.loc[idx, common_cols]
+        rets = rets.loc[idx, common_cols]
+        # Long format via melt (robust to column/index naming)
+        fl = f_panel.reset_index()
+        date_col_f = fl.columns[0]
+        f_long = fl.melt(id_vars=[date_col_f], var_name='ticker', value_name='factor').rename(columns={date_col_f: 'date'})
+        rl = rets.reset_index()
+        date_col_r = rl.columns[0]
+        r_long = rl.melt(id_vars=[date_col_r], var_name='ticker', value_name='next_ret').rename(columns={date_col_r: 'date'})
+        dfm = pd.merge(f_long.dropna(), r_long.dropna(), on=['date','ticker'], how='inner')
+        if dfm.empty:
+            return None
+        # IC series
+        def cs_ic(g):
+            gg = g[['factor','next_ret']].dropna()
+            if len(gg) < 3:
+                return np.nan
+            return gg['factor'].corr(gg['next_ret'], method='spearman')
+        ic_series = dfm.groupby('date').apply(cs_ic).dropna()
+        if ic_series.empty:
+            from scipy.stats import spearmanr
+            pooled = dfm[['factor','next_ret']].dropna()
+            ic_overall = spearmanr(pooled['factor'], pooled['next_ret']).correlation if len(pooled) >= 3 else np.nan
+            if pd.notna(ic_overall):
+                ic_series = pd.Series([ic_overall], index=[dfm['date'].min()])
+        ir = ic_series.mean() / ic_series.std() if (len(ic_series) > 1 and ic_series.std() not in [0, np.nan]) else np.nan
+        # Quantiles and LS
+        def assign_q(x):
+            return pd.qcut(x, q=quantiles, labels=False, duplicates='drop')
+        dfm = dfm.sort_values(['date','factor'])
+        dfm['q'] = dfm.groupby('date')['factor'].transform(assign_q)
+        grp = dfm.groupby(['date','q'])['next_ret'].mean().reset_index()
+        piv = grp.pivot(index='date', columns='q', values='next_ret').sort_index()
+        valid_cols = [c for c in list(piv.columns) if pd.notna(c)]
+        valid_cols = sorted(valid_cols)
+        if len(valid_cols) >= 2:
+            low_col, high_col = valid_cols[0], valid_cols[-1]
+            ls = (piv[high_col] - piv[low_col]).fillna(0)
+            eq_curves = (1 + piv.fillna(0)).cumprod()
+        else:
+            # Tertile fallback
+            def ls_tercile(g):
+                g2 = g.copy()
+                g2['rk'] = g2['factor'].rank(method='first')
+                n = len(g2)
+                if n < 3:
+                    return 0.0
+                lo_thr = np.floor(n/3)
+                hi_thr = np.ceil(2*n/3)
+                low_ret = g2.nsmallest(int(max(1, lo_thr)), 'rk')['next_ret'].mean()
+                high_ret = g2.nlargest(int(max(1, n - hi_thr)), 'rk')['next_ret'].mean()
+                return (high_ret - low_ret)
+            ls_series = dfm.groupby('date').apply(ls_tercile)
+            ls = ls_series.reindex(sorted(ls_series.index)).fillna(0)
+            eq_curves = pd.DataFrame()
+        ls_curve = (1 + ls.fillna(0)).cumprod()
+        return {"ic_series": ic_series, "ir": ir, "eq_curves": eq_curves, "ls_curve": ls_curve, "sample": dfm}
+
+    st.markdown("#### Upload Factor CSV")
+    col_u1, col_u2 = st.columns([2,1])
+    with col_u1:
+        upl = st.file_uploader("Upload CSV (date,ticker,factor)", type=["csv"], key="factor_upload")
+        fname = st.text_input("Factor Name", "my_factor")
+        freq = st.selectbox("Frequency", ["daily","weekly"], index=0)
+        notes = st.text_input("Notes", "")
+    with col_u2:
+        do_register = st.button("Save & Register")
+    if do_register and upl is not None and fname:
+        try:
+            fdf = pd.read_csv(upl)
+            assert {'date','ticker','factor'}.issubset(set(fdf.columns))
+            path = os.path.join(base_dir, f"{fname}.csv")
+            fdf.to_csv(path, index=False)
+            reg = load_registry()
+            reg = pd.concat([reg, pd.DataFrame([{
+                'name': fname,
+                'asset_universe': ','.join(sorted(fdf['ticker'].unique().tolist())[:10]) + ('...' if fdf['ticker'].nunique()>10 else ''),
+                'freq': freq,
+                'file_path': path,
+                'created_at': pd.Timestamp.utcnow(),
+                'notes': notes
+            }])], ignore_index=True)
+            reg.to_csv(registry_path, index=False)
+            st.success(f"Registered factor '{fname}'.")
+        except Exception as e:
+            st.error(f"Upload failed: {e}")
+
+    st.markdown("#### Factor Registry")
+    reg = load_registry()
+    st.dataframe(reg)
+
+    st.markdown("#### Evaluate a Factor")
+    eval_mode = st.selectbox("Source", ["Default: Momentum 6M", "From Registry", "Upload ad-hoc CSV"], index=0)
+    horizon = st.selectbox("Next-return horizon", ["1d","1w"], index=0)
+    quantiles = st.slider("Quantiles", 3, 10, 5)
+
+    fdf_eval = None
+    res_default = None
+    if eval_mode == "Default: Momentum 6M":
+        universe = [
+            "AAPL","MSFT","AMZN","GOOG","GOOGL","META","NVDA","TSLA","AMD","NFLX",
+            "SPY","QQQ","DIA","IWM","XLK","XLF","XLE","XLV","XLY","XLP",
+            "JPM","BAC","WFC","V","MA","UNH","PFE","JNJ","XOM","CVX",
+            "KO","PEP","MCD","NKE","DIS","CSCO","ORCL","ADBE","INTC","IBM"
+        ]
+        st.caption("Default factor = 6M momentum (≈126 trading days) on a broad liquid universe (10y history).")
+
+        @st.cache_data(show_spinner=False, ttl=3600)
+        def _dl_close(sym: str, period: str = '10y'):
+            try:
+                dfp = yf.download(sym, period=period, interval='1d')[["Close"]].rename(columns={"Close": sym})
+                return dfp
+            except Exception:
+                return pd.DataFrame()
+
+        prices = []
+        for t in universe:
+            p = _dl_close(t, period='10y')
+            if not p.empty:
+                prices.append(p)
+        prices = pd.concat(prices, axis=1).dropna(how='all')
+        prices.index = pd.to_datetime(prices.index).tz_localize(None)
+        mom = prices / prices.shift(126) - 1.0
+        fdf_eval = mom.stack().reset_index()
+        # Robustly rename the first three columns to expected names
+        cols = list(fdf_eval.columns)
+        if len(cols) >= 3:
+            fdf_eval = fdf_eval.rename(columns={cols[0]: 'date', cols[1]: 'ticker', cols[2]: 'factor'})[
+                ['date','ticker','factor']
+            ]
+        # Use panel-based evaluator for the default demo
+        res_default = evaluate_from_panels(mom, prices, horizon=horizon, quantiles=quantiles)
+    elif eval_mode == "From Registry" and not reg.empty:
+        pick = st.selectbox("Choose factor", reg['name'].tolist())
+        path = reg.loc[reg['name']==pick, 'file_path'].iloc[0]
+        try:
+            fdf_eval = pd.read_csv(path)
+        except Exception as e:
+            st.error(f"Failed to load factor: {e}")
+    elif eval_mode == "Upload ad-hoc CSV":
+        up_eval = st.file_uploader("Upload factor CSV for evaluation", type=["csv"], key="factor_eval")
+        if up_eval is not None:
+            try:
+                fdf_eval = pd.read_csv(up_eval)
+            except Exception as e:
+                st.error(f"Failed to read CSV: {e}")
+
+    # Unified evaluation + rendering
+    res = None
+    if eval_mode == "Default: Momentum 6M" and res_default is not None:
+        res = res_default
+    elif fdf_eval is not None and {'date','ticker','factor'}.issubset(set(fdf_eval.columns)):
+        with st.spinner("Evaluating factor..."):
+            res = evaluate_factor(fdf_eval, horizon=horizon, quantiles=quantiles, min_tickers=3)
+    if res is None:
+        st.warning("No overlapping price/return data. Try another horizon or factor.")
+    else:
+        ic = res['ic_series']
+        ir = res['ir']
+        eq = res['eq_curves']
+        ls = res['ls_curve']
+        # If IC too thin, auto-fallback to weekly once
+        if len(ic) <= 1 and eval_mode == "Default: Momentum 6M" and horizon == "1d":
+            with st.spinner("Auto-switching to weekly horizon for more robust cross-sections..."):
+                res_alt = evaluate_from_panels(mom, prices, horizon='1w', quantiles=quantiles)
+            if res_alt is not None:
+                ic, ir, eq, ls = res_alt['ic_series'], res_alt['ir'], res_alt['eq_curves'], res_alt['ls_curve']
+
+        # IR fallback if not enough dates
+        if not pd.notna(ir) or len(ic) < 2 or (ic.std() == 0):
+            ir_display = 0.0
+            st.caption("IR set to 0.0 due to insufficient IC observations.")
+        else:
+            ir_display = float(ir)
+
+        tickers_count = int(res['sample']['ticker'].nunique()) if 'sample' in res and not res['sample'].empty else (len(prices.columns) if 'prices' in locals() else 0)
+        st.write({
+            "IC_mean": float(ic.mean()) if len(ic) else np.nan,
+            "IC_std": float(ic.std()) if len(ic) else np.nan,
+            "IR": ir_display,
+            "obs_dates": int(len(ic)),
+            "tickers": tickers_count,
+        })
+
+        st.markdown("##### IC time series")
+        ic_df = ic.reset_index()
+        if ic_df.shape[1] >= 2:
+            ic_df = ic_df.rename(columns={ic_df.columns[0]: 'date', ic_df.columns[1]: 'IC'})
+        st.altair_chart(alt.Chart(ic_df).mark_line().encode(x='date:T', y='IC:Q', tooltip=['date:T','IC:Q']).properties(height=220), use_container_width=True)
+
+        st.markdown("##### IC histogram")
+        st.altair_chart(alt.Chart(ic_df[['IC']]).mark_bar(opacity=0.7).encode(x=alt.X('IC:Q', bin=alt.Bin(maxbins=40)), y='count():Q').properties(height=160), use_container_width=True)
+
+        st.markdown("##### Quantile portfolios")
+        if isinstance(eq, pd.DataFrame) and not eq.empty:
+            eq_df = eq.reset_index()
+            date_col = eq_df.columns[0]
+            eq_long = eq_df.melt(id_vars=[date_col], var_name='q', value_name='equity').rename(columns={date_col: 'date'})
+            st.altair_chart(alt.Chart(eq_long).mark_line().encode(x='date:T', y='equity:Q', color='q:N', tooltip=['date:T','q','equity']).properties(height=260), use_container_width=True)
+        else:
+            st.info("Quantile equity curves not available for fallback; showing only long-short.")
+
+        st.markdown("##### Long-Short (Q_high - Q_low)")
+        ls_df = ls.reset_index()
+        if ls_df.shape[1] >= 2:
+            ls_df = ls_df.rename(columns={ls_df.columns[0]: 'date', ls_df.columns[1]: 'equity'})
+            st.altair_chart(alt.Chart(ls_df).mark_line(color='#10b981').encode(x='date:T', y='equity:Q', tooltip=['date:T','equity']).properties(height=220), use_container_width=True)
+        else:
+            st.info("Long-short series unavailable.")
+
+        st.markdown("##### Sample (latest date) scatter: factor vs next_return")
+        latest = res['sample'] if 'sample' in res else pd.DataFrame()
+        if not latest.empty:
+            last_date = latest['date'].max()
+            tmp = latest[latest['date']==last_date]
+            st.altair_chart(alt.Chart(tmp).mark_circle().encode(x='factor:Q', y='next_ret:Q', color=alt.value('#6366f1'), tooltip=['ticker','factor','next_ret']).properties(height=220), use_container_width=True)
+
+with tabs[5]:  # Learn
     st.subheader("Learn")
     st.markdown("### Strategies")
     st.markdown("- Mean reversion: buy when price is below its recent mean, sell when above; expects reversion.")
