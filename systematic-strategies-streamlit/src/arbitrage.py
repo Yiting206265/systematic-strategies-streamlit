@@ -25,7 +25,7 @@ def risk_arbitrage_signal(
     # Vol targeting on returns
     ret = df['returns'].fillna(0.0)
     lam = np.log(2) / max(1, vol_ewm_halflife)
-    ewm_var = ret.ewm(alpha=1 - np.exp(-lam)).var().fillna(method='bfill')
+    ewm_var = ret.ewm(alpha=1 - np.exp(-lam)).var().bfill()
     daily_vol = np.sqrt(ewm_var)
     ann_vol = daily_vol * np.sqrt(252)
     leverage = (vol_target / ann_vol).clip(lower=0.0, upper=max_leverage)
